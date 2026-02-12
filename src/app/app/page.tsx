@@ -163,11 +163,14 @@ export default function AppPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [viewMode, setViewMode] = useState<"all" | "unsummarized" | "summarized">("all");
+  const [justImported, setJustImported] = useState(0); // count of just-imported bookmarks
   const fileRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef(false);
 
   useEffect(() => {
-    setBookmarks(getBookmarks());
+    const bm = getBookmarks();
+    setBookmarks(bm);
+    if (bm.length === 0) setShowImport(true);
   }, []);
 
   const refresh = useCallback(() => {
@@ -262,7 +265,10 @@ export default function AppPage() {
     const parsed = parseUrlList(urlInput);
     const added = importBookmarks(parsed);
     setUrlInput("");
-    if (added > 0) setShowImport(false);
+    if (added > 0) {
+      setShowImport(false);
+      setJustImported(added);
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -271,8 +277,9 @@ export default function AppPage() {
     const html = await file.text();
     const parsed = parseBookmarksHtml(html);
     if (parsed.length === 0) return;
-    importBookmarks(parsed);
+    const added = importBookmarks(parsed);
     setShowImport(false);
+    setJustImported(added);
   };
 
   const handleDelete = (id: string) => {
@@ -392,6 +399,36 @@ export default function AppPage() {
             <div className="mt-6 pt-6 border-t border-white/5">
               <ImportGuides />
             </div>
+          </div>
+        )}
+
+        {/* Just Imported Banner */}
+        {justImported > 0 && !isProcessing && (
+          <div className="mb-6 bg-gradient-to-r from-blue-500/10 to-cyan-500/10 border border-blue-500/20 rounded-2xl p-6 text-center">
+            <span className="text-4xl block mb-3">🎉</span>
+            <h2 className="text-xl font-bold text-white mb-2">
+              {justImported} bookmarks imported!
+            </h2>
+            <p className="text-gray-400 mb-5 text-sm">
+              Now let AI read them for you. It&apos;ll summarize each one with key takeaways and auto-categorize them.
+            </p>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={() => { setJustImported(0); summarizeAll(); }}
+                className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-400 hover:to-cyan-400 text-white px-8 py-3 rounded-xl font-semibold transition shadow-lg shadow-blue-500/25 text-sm"
+              >
+                🧠 Summarize All — Let AI Read Them
+              </button>
+              <button
+                onClick={() => setJustImported(0)}
+                className="text-gray-500 hover:text-gray-300 px-4 py-3 rounded-xl transition text-sm"
+              >
+                I&apos;ll do it later
+              </button>
+            </div>
+            <p className="text-xs text-gray-600 mt-3">
+              ⚡ Processes 5 at a time • ~{Math.ceil(justImported / 5 * 5 / 60)} min for all {justImported}
+            </p>
           </div>
         )}
 

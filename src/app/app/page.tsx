@@ -28,6 +28,123 @@ function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+const IMPORT_GUIDES = [
+  {
+    id: "chrome",
+    icon: "🌐",
+    name: "Google Chrome",
+    steps: [
+      "Open Chrome and press ⌘+Shift+O (Mac) or Ctrl+Shift+O (Windows)",
+      "Click the ⋮ menu (top-right of Bookmark Manager)",
+      'Select "Export bookmarks"',
+      "Save the HTML file, then upload it here",
+    ],
+  },
+  {
+    id: "firefox",
+    icon: "🦊",
+    name: "Firefox",
+    steps: [
+      "Open Firefox and press ⌘+Shift+O (Mac) or Ctrl+Shift+O (Windows)",
+      'Click "Import and Backup" in the toolbar',
+      'Select "Export Bookmarks to HTML..."',
+      "Save the file, then upload it here",
+    ],
+  },
+  {
+    id: "safari",
+    icon: "🧭",
+    name: "Safari",
+    steps: [
+      "Open Safari → File menu → Export → Bookmarks...",
+      "Save the HTML file",
+      "Upload it here",
+    ],
+  },
+  {
+    id: "x",
+    icon: "𝕏",
+    name: "X / Twitter",
+    steps: [
+      "Go to x.com → More → Settings → Your account",
+      'Click "Download an archive of your data"',
+      "Wait for the archive (can take 24h)",
+      "Or: just go through your X bookmarks and paste the URLs here one per line",
+    ],
+  },
+  {
+    id: "reddit",
+    icon: "🤖",
+    name: "Reddit Saved",
+    steps: [
+      "Go to reddit.com/user/YOUR_USERNAME/saved/",
+      "Copy the URLs of posts you want to save",
+      "Paste them in the URL box above (one per line)",
+    ],
+  },
+  {
+    id: "pocket",
+    icon: "📌",
+    name: "Pocket",
+    steps: [
+      "Go to getpocket.com → Settings → Export",
+      "Download the HTML file",
+      "Upload it here — same format as browser bookmarks",
+    ],
+  },
+];
+
+function ImportGuides() {
+  const [openGuide, setOpenGuide] = useState<string | null>(null);
+
+  return (
+    <div>
+      <h3 className="text-sm font-medium text-gray-400 mb-3">📖 How to export your bookmarks</h3>
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+        {IMPORT_GUIDES.map((guide) => (
+          <button
+            key={guide.id}
+            onClick={() => setOpenGuide(openGuide === guide.id ? null : guide.id)}
+            className={`text-left p-3 rounded-xl border transition text-sm ${
+              openGuide === guide.id
+                ? "bg-blue-500/10 border-blue-500/30 text-white"
+                : "bg-white/[0.02] border-white/5 text-gray-400 hover:border-white/10 hover:text-gray-300"
+            }`}
+          >
+            <span className="text-lg block mb-1">{guide.icon}</span>
+            <span className="text-xs font-medium">{guide.name}</span>
+          </button>
+        ))}
+      </div>
+      {openGuide && (
+        <div className="mt-4 bg-white/[0.03] border border-white/5 rounded-xl p-4">
+          {(() => {
+            const guide = IMPORT_GUIDES.find((g) => g.id === openGuide)!;
+            return (
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="text-lg">{guide.icon}</span>
+                  <span className="font-medium text-white text-sm">{guide.name}</span>
+                </div>
+                <ol className="space-y-2">
+                  {guide.steps.map((step, i) => (
+                    <li key={i} className="flex items-start gap-3 text-sm text-gray-400">
+                      <span className="shrink-0 w-5 h-5 rounded-full bg-blue-500/20 text-blue-400 text-xs flex items-center justify-center font-medium mt-0.5">
+                        {i + 1}
+                      </span>
+                      <span>{step}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function AppPage() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [search, setSearch] = useState("");
@@ -202,6 +319,11 @@ export default function AppPage() {
                   className="hidden"
                 />
               </div>
+            </div>
+
+            {/* Import Guides */}
+            <div className="mt-6 pt-6 border-t border-white/5">
+              <ImportGuides />
             </div>
           </div>
         )}

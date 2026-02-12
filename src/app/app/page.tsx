@@ -145,48 +145,79 @@ function ImportGuides() {
   );
 }
 
+// Rate-limited batch processor
+const BATCH_SIZE = 5;
+const DELAY_BETWEEN_BATCHES = 4500; // ~13 req/min stays under 15 RPM
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default function AppPage() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All");
   const [urlInput, setUrlInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processProgress, setProcessProgress] = useState({ done: 0, total: 0 });
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [viewMode, setViewMode] = useState<"all" | "unsummarized" | "summarized">("all");
   const fileRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef(false);
 
   useEffect(() => {
     setBookmarks(getBookmarks());
   }, []);
 
-  const processingRef = useRef(false);
-
-  const processUrl = useCallback(async (url: string, title: string): Promise<void> => {
-    const id = generateId();
-    const bookmark: Bookmark = {
-      id,
-      url,
-      title: title || new URL(url).hostname,
-      summary: "",
-      takeaways: [],
-      category: "Other",
-      favicon: `https://www.google.com/s2/favicons?domain=${new URL(url).hostname}&sz=32`,
-      status: "pending",
-      createdAt: Date.now(),
-    };
-    addBookmark(bookmark);
+  const refresh = useCallback(() => {
     setBookmarks(getBookmarks());
+  }, []);
+
+  // Just import — don't summarize yet
+  const importBookmarks = useCallback((items: { url: string; title: string }[]) => {
+    const existing = getBookmarks();
+    const existingUrls = new Set(existing.map((b) => b.url));
+    let added = 0;
+
+    for (const { url, title } of items) {
+      if (existingUrls.has(url)) continue; // skip duplicates
+      const bookmark: Bookmark = {
+        id: generateId(),
+        url,
+        title: title || (() => { try { return new URL(url).hostname; } catch { return url; } })(),
+        summary: "",
+        takeaways: [],
+        category: "Other",
+        favicon: (() => { try { return `https://www.google.com/s2/favicons?domain=${new URL(url).hostname}&sz=32`; } catch { return ""; } })(),
+        status: "imported",
+        createdAt: Date.now(),
+      };
+      addBookmark(bookmark);
+      added++;
+    }
+    refresh();
+    return added;
+  }, [refresh]);
+
+  // Summarize a single bookmark
+  const summarizeOne = useCallback(async (id: string) => {
+    const bm = getBookmarks().find((b) => b.id === id);
+    if (!bm) return;
+
+    updateBookmark(id, { status: "pending" });
+    refresh();
 
     try {
       const res = await fetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url: bm.url }),
       });
       const data = await res.json();
       if (res.ok) {
         updateBookmark(id, {
-          title: data.title || bookmark.title,
+          title: data.title || bm.title,
           summary: data.summary,
           takeaways: data.takeaways,
           category: data.category,
@@ -198,20 +229,40 @@ export default function AppPage() {
     } catch {
       updateBookmark(id, { status: "error", summary: "Failed to summarize" });
     }
-    setBookmarks(getBookmarks());
-  }, []);
+    refresh();
+  }, [refresh]);
 
-  const handleSubmitUrls = async () => {
-    if (processingRef.current) return;
-    processingRef.current = true;
+  // Batch summarize all unsummarized
+  const summarizeAll = useCallback(async () => {
+    const unsummarized = getBookmarks().filter((b) => b.status === "imported" || b.status === "error");
+    if (unsummarized.length === 0) return;
+
     setIsProcessing(true);
-    const parsed = parseUrlList(urlInput);
-    for (const { url, title } of parsed) {
-      await processUrl(url, title);
+    abortRef.current = false;
+    setProcessProgress({ done: 0, total: unsummarized.length });
+
+    for (let i = 0; i < unsummarized.length; i += BATCH_SIZE) {
+      if (abortRef.current) break;
+      const batch = unsummarized.slice(i, i + BATCH_SIZE);
+
+      // Process batch in parallel
+      await Promise.all(batch.map((bm) => summarizeOne(bm.id)));
+      setProcessProgress({ done: Math.min(i + BATCH_SIZE, unsummarized.length), total: unsummarized.length });
+
+      // Rate limit pause between batches
+      if (i + BATCH_SIZE < unsummarized.length && !abortRef.current) {
+        await sleep(DELAY_BETWEEN_BATCHES);
+      }
     }
-    setUrlInput("");
+
     setIsProcessing(false);
-    processingRef.current = false;
+  }, [summarizeOne]);
+
+  const handleSubmitUrls = () => {
+    const parsed = parseUrlList(urlInput);
+    const added = importBookmarks(parsed);
+    setUrlInput("");
+    if (added > 0) setShowImport(false);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -220,26 +271,26 @@ export default function AppPage() {
     const html = await file.text();
     const parsed = parseBookmarksHtml(html);
     if (parsed.length === 0) return;
-    setIsProcessing(true);
-    processingRef.current = true;
+    importBookmarks(parsed);
     setShowImport(false);
-    for (const { url, title } of parsed) {
-      await processUrl(url, title);
-    }
-    setIsProcessing(false);
-    processingRef.current = false;
   };
 
   const handleDelete = (id: string) => {
     deleteBookmark(id);
-    setBookmarks(getBookmarks());
+    refresh();
   };
 
   const handleClearAll = () => {
+    if (!confirm("Delete all bookmarks? This can't be undone.")) return;
     saveBookmarks([]);
-    setBookmarks([]);
+    refresh();
   };
 
+  const handleStopProcessing = () => {
+    abortRef.current = true;
+  };
+
+  // Filter logic
   const filtered = bookmarks.filter((b) => {
     const matchCategory = category === "All" || b.category === category;
     const matchSearch =
@@ -248,13 +299,21 @@ export default function AppPage() {
       b.summary.toLowerCase().includes(search.toLowerCase()) ||
       b.url.toLowerCase().includes(search.toLowerCase()) ||
       b.takeaways.some((t) => t.toLowerCase().includes(search.toLowerCase()));
-    return matchCategory && matchSearch;
+    const matchView =
+      viewMode === "all" ||
+      (viewMode === "unsummarized" && (b.status === "imported" || b.status === "error")) ||
+      (viewMode === "summarized" && b.status === "done");
+    return matchCategory && matchSearch && matchView;
   });
 
   const categoryCounts = bookmarks.reduce<Record<string, number>>((acc, b) => {
-    acc[b.category] = (acc[b.category] || 0) + 1;
+    if (b.status === "done") acc[b.category] = (acc[b.category] || 0) + 1;
     return acc;
   }, {});
+
+  const unsummarizedCount = bookmarks.filter((b) => b.status === "imported" || b.status === "error").length;
+  const summarizedCount = bookmarks.filter((b) => b.status === "done").length;
+  const pendingCount = bookmarks.filter((b) => b.status === "pending").length;
 
   return (
     <div className="min-h-screen bg-gray-950">
@@ -267,9 +326,17 @@ export default function AppPage() {
           </Link>
           <div className="flex items-center gap-3">
             <span className="text-sm text-gray-500">{bookmarks.length} bookmarks</span>
+            {unsummarizedCount > 0 && !isProcessing && (
+              <button
+                onClick={summarizeAll}
+                className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-400 hover:to-cyan-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-lg shadow-blue-500/20"
+              >
+                🧠 Summarize {unsummarizedCount} bookmarks
+              </button>
+            )}
             <button
               onClick={() => setShowImport(!showImport)}
-              className="bg-blue-500 hover:bg-blue-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition"
+              className="bg-white/5 hover:bg-white/10 border border-white/10 text-white px-4 py-2 rounded-lg text-sm font-medium transition"
             >
               + Import
             </button>
@@ -294,10 +361,10 @@ export default function AppPage() {
                 />
                 <button
                   onClick={handleSubmitUrls}
-                  disabled={isProcessing || !urlInput.trim()}
+                  disabled={!urlInput.trim()}
                   className="mt-3 bg-blue-500 hover:bg-blue-400 disabled:bg-gray-700 disabled:text-gray-500 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition"
                 >
-                  {isProcessing ? "Processing..." : "Summarize URLs"}
+                  Import URLs
                 </button>
               </div>
               {/* Upload File */}
@@ -328,52 +395,91 @@ export default function AppPage() {
           </div>
         )}
 
-        {/* Search & Filter */}
-        <div className="flex flex-col sm:flex-row gap-4 mb-6">
-          <div className="relative flex-1">
-            <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500">🔍</span>
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search bookmarks..."
-              className="w-full bg-white/5 border border-white/10 rounded-xl pl-11 pr-4 py-3 text-white text-sm placeholder:text-gray-600 focus:outline-none focus:border-blue-500/50"
-            />
-          </div>
-          {bookmarks.length > 0 && (
-            <button
-              onClick={handleClearAll}
-              className="text-sm text-red-400 hover:text-red-300 px-4 py-2 border border-red-500/20 rounded-lg transition"
-            >
-              Clear All
-            </button>
-          )}
-        </div>
-
-        {/* Category Chips */}
+        {/* Stats Bar */}
         {bookmarks.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-8">
-            {CATEGORIES.filter((c) => c === "All" || categoryCounts[c]).map((c) => (
+          <div className="flex flex-wrap items-center gap-3 mb-6">
+            <button
+              onClick={() => setViewMode("all")}
+              className={`px-3 py-1.5 rounded-lg text-sm transition ${
+                viewMode === "all" ? "bg-white/10 text-white" : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              All ({bookmarks.length})
+            </button>
+            {unsummarizedCount > 0 && (
               <button
-                key={c}
-                onClick={() => setCategory(c)}
+                onClick={() => setViewMode("unsummarized")}
                 className={`px-3 py-1.5 rounded-lg text-sm transition ${
-                  category === c
-                    ? "bg-blue-500 text-white"
-                    : "bg-white/5 text-gray-400 hover:bg-white/10"
+                  viewMode === "unsummarized" ? "bg-yellow-500/20 text-yellow-400" : "text-gray-500 hover:text-gray-300"
                 }`}
               >
-                {c}
-                {c !== "All" && categoryCounts[c] && (
-                  <span className="ml-1.5 text-xs opacity-60">{categoryCounts[c]}</span>
-                )}
+                ⏳ Needs Summary ({unsummarizedCount})
               </button>
-            ))}
+            )}
+            {summarizedCount > 0 && (
+              <button
+                onClick={() => setViewMode("summarized")}
+                className={`px-3 py-1.5 rounded-lg text-sm transition ${
+                  viewMode === "summarized" ? "bg-green-500/20 text-green-400" : "text-gray-500 hover:text-gray-300"
+                }`}
+              >
+                ✅ Summarized ({summarizedCount})
+              </button>
+            )}
+
+            <div className="flex-1" />
+
+            {bookmarks.length > 0 && (
+              <button
+                onClick={handleClearAll}
+                className="text-xs text-gray-600 hover:text-red-400 px-3 py-1.5 transition"
+              >
+                Clear All
+              </button>
+            )}
           </div>
         )}
 
-        {/* Bookmarks Grid */}
-        {filtered.length === 0 && !showImport ? (
+        {/* Search & Category Filter */}
+        {bookmarks.length > 0 && (
+          <>
+            <div className="relative mb-4">
+              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500">🔍</span>
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search bookmarks by title, summary, or URL..."
+                className="w-full bg-white/5 border border-white/10 rounded-xl pl-11 pr-4 py-3 text-white text-sm placeholder:text-gray-600 focus:outline-none focus:border-blue-500/50"
+              />
+            </div>
+
+            {/* Category Chips */}
+            {summarizedCount > 0 && (
+              <div className="flex flex-wrap gap-2 mb-6">
+                {CATEGORIES.filter((c) => c === "All" || categoryCounts[c]).map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => setCategory(c)}
+                    className={`px-3 py-1.5 rounded-lg text-sm transition ${
+                      category === c
+                        ? "bg-blue-500 text-white"
+                        : "bg-white/5 text-gray-400 hover:bg-white/10"
+                    }`}
+                  >
+                    {c}
+                    {c !== "All" && categoryCounts[c] && (
+                      <span className="ml-1.5 text-xs opacity-60">{categoryCounts[c]}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Bookmarks List */}
+        {filtered.length === 0 && bookmarks.length === 0 && !showImport ? (
           <div className="text-center py-20">
             <span className="text-5xl mb-4 block">📚</span>
             <h2 className="text-xl font-semibold text-white mb-2">No bookmarks yet</h2>
@@ -385,51 +491,78 @@ export default function AppPage() {
               + Import Bookmarks
             </button>
           </div>
+        ) : filtered.length === 0 ? (
+          <div className="text-center py-16">
+            <span className="text-3xl mb-3 block">🔍</span>
+            <p className="text-gray-400">No bookmarks match your filters</p>
+          </div>
         ) : (
-          <div className="grid gap-4">
+          <div className="grid gap-3">
             {filtered.map((b) => (
               <div
                 key={b.id}
-                className="bg-white/[0.02] border border-white/5 rounded-xl p-5 hover:border-white/10 transition group"
+                className={`border rounded-xl p-4 transition group ${
+                  b.status === "done"
+                    ? "bg-white/[0.02] border-white/5 hover:border-white/10"
+                    : b.status === "pending"
+                    ? "bg-blue-500/[0.03] border-blue-500/10"
+                    : b.status === "error"
+                    ? "bg-red-500/[0.03] border-red-500/10"
+                    : "bg-white/[0.01] border-white/5 hover:border-white/10"
+                }`}
               >
-                <div className="flex items-start gap-4">
+                <div className="flex items-start gap-3">
                   {/* Favicon */}
                   <img
                     src={b.favicon}
                     alt=""
                     width={20}
                     height={20}
-                    className="mt-1 rounded"
+                    className="mt-1 rounded shrink-0"
                     onError={(e) => {
                       (e.target as HTMLImageElement).src =
                         "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23374151'/><text x='16' y='22' text-anchor='middle' fill='white' font-size='16'>🔗</text></svg>";
                     }}
                   />
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-1">
+                    <div className="flex items-center gap-2 mb-0.5">
                       <a
                         href={b.url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="font-medium text-white hover:text-blue-400 transition truncate"
+                        className="font-medium text-white hover:text-blue-400 transition truncate text-sm"
                       >
                         {b.title}
                       </a>
-                      <span
-                        className={`shrink-0 text-xs px-2 py-0.5 rounded-full ${
-                          b.status === "pending"
-                            ? "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"
-                            : b.status === "error"
-                            ? "bg-red-500/10 text-red-400 border border-red-500/20"
-                            : "bg-blue-500/10 text-blue-400 border border-blue-500/20"
-                        }`}
-                      >
-                        {b.status === "pending" ? "⏳ Processing" : b.category}
-                      </span>
+                      {b.status === "done" && (
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                          {b.category}
+                        </span>
+                      )}
+                      {b.status === "pending" && (
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 flex items-center gap-1">
+                          <span className="inline-block w-3 h-3 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
+                          Reading...
+                        </span>
+                      )}
+                      {b.status === "imported" && (
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-gray-500/10 text-gray-400 border border-gray-500/20">
+                          Not read yet
+                        </span>
+                      )}
+                      {b.status === "error" && (
+                        <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20">
+                          Error
+                        </span>
+                      )}
                     </div>
-                    <p className="text-sm text-gray-500 truncate mb-2">{b.url}</p>
-                    {b.summary && <p className="text-sm text-gray-300 mb-2">{b.summary}</p>}
-                    {b.takeaways.length > 0 && (
+                    <p className="text-xs text-gray-600 truncate mb-1">{b.url}</p>
+
+                    {b.status === "done" && b.summary && (
+                      <p className="text-sm text-gray-300 mb-1">{b.summary}</p>
+                    )}
+
+                    {b.status === "done" && b.takeaways.length > 0 && (
                       <div>
                         <button
                           onClick={() => setExpandedId(expandedId === b.id ? null : b.id)}
@@ -449,10 +582,20 @@ export default function AppPage() {
                         )}
                       </div>
                     )}
+
+                    {/* Summarize button for unsummarized */}
+                    {(b.status === "imported" || b.status === "error") && !isProcessing && (
+                      <button
+                        onClick={() => summarizeOne(b.id)}
+                        className="mt-2 text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 px-3 py-1.5 rounded-lg transition border border-blue-500/20"
+                      >
+                        🧠 Summarize this
+                      </button>
+                    )}
                   </div>
                   <button
                     onClick={() => handleDelete(b.id)}
-                    className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 transition text-sm p-1"
+                    className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 transition text-sm p-1 shrink-0"
                     title="Delete"
                   >
                     ✕
@@ -463,11 +606,37 @@ export default function AppPage() {
           </div>
         )}
 
-        {/* Processing indicator */}
+        {/* Processing Overlay */}
         {isProcessing && (
-          <div className="fixed bottom-6 right-6 bg-gray-900 border border-white/10 rounded-xl px-5 py-3 shadow-2xl flex items-center gap-3">
-            <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-            <span className="text-sm text-gray-300">Processing bookmarks...</span>
+          <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-gray-900 border border-white/10 rounded-2xl px-6 py-4 shadow-2xl flex items-center gap-4 z-50">
+            <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
+            <div>
+              <p className="text-sm text-white font-medium">
+                Summarizing... {processProgress.done}/{processProgress.total}
+              </p>
+              <p className="text-xs text-gray-500">
+                {Math.round((processProgress.done / processProgress.total) * 100)}% • ~{Math.ceil((processProgress.total - processProgress.done) / BATCH_SIZE * 5)}s remaining
+              </p>
+            </div>
+            <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 rounded-full transition-all duration-500"
+                style={{ width: `${(processProgress.done / processProgress.total) * 100}%` }}
+              />
+            </div>
+            <button
+              onClick={handleStopProcessing}
+              className="text-xs text-gray-400 hover:text-red-400 px-3 py-1.5 border border-white/10 rounded-lg transition"
+            >
+              Stop
+            </button>
+          </div>
+        )}
+
+        {/* Pending count — gentle nudge */}
+        {pendingCount > 0 && !isProcessing && (
+          <div className="fixed bottom-6 right-6 bg-gray-900 border border-blue-500/20 rounded-xl px-4 py-3 shadow-2xl">
+            <p className="text-sm text-blue-400">{pendingCount} bookmarks being read by AI...</p>
           </div>
         )}
       </div>

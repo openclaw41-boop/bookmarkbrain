@@ -6,7 +6,7 @@ export interface Bookmark {
   takeaways: string[];
   category: string;
   favicon: string;
-  status: "pending" | "done" | "error";
+  status: "imported" | "pending" | "done" | "error";
   createdAt: number;
 }
 
